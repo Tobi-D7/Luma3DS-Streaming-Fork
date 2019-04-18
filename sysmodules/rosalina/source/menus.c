@@ -35,6 +35,7 @@
 #include "menus/miscellaneous.h"
 #include "menus/sysconfig.h"
 #include "menus/screen_filters.h"
+#include "menus/streaming.h"
 #include "ifile.h"
 #include "memory.h"
 #include "fmt.h"
@@ -43,9 +44,11 @@
 
 Menu rosalinaMenu = {
     "Rosalina menu",
+    .nbItems = 12,
     {
-        { "Take screenshot", METHOD, .method = &RosalinaMenu_TakeScreenshot },
-        { "Change screen brightness", METHOD, .method = &RosalinaMenu_ChangeScreenBrightness },
+        { "Reboot", METHOD, .method = &RosalinaMenu_Reboot },
+        { "Streaming", MENU, .menu = &streamingMenu },
+        { "New 3DS menu...", MENU, .menu = &N3DSMenu },
         { "Cheats...", METHOD, .method = &RosalinaMenu_Cheats },
         { "Process list", METHOD, .method = &RosalinaMenu_ProcessList },
         { "Debugger options...", MENU, .menu = &debuggerMenu },
@@ -54,10 +57,7 @@ Menu rosalinaMenu = {
         { "New 3DS menu...", MENU, .menu = &N3DSMenu, .visibility = &menuCheckN3ds },
         { "Miscellaneous options...", MENU, .menu = &miscellaneousMenu },
         { "Power off", METHOD, .method = &RosalinaMenu_PowerOff },
-        { "Reboot", METHOD, .method = &RosalinaMenu_Reboot },
-        { "Credits", METHOD, .method = &RosalinaMenu_ShowCredits },
-        { "Debug info", METHOD, .method = &RosalinaMenu_ShowDebugInfo, .visibility = &rosalinaMenuShouldShowDebugInfo },
-        {},
+        { "Credits", METHOD, .method = &RosalinaMenu_ShowCredits }
     }
 };
 
