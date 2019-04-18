@@ -36,14 +36,17 @@
 #include "menus/miscellaneous.h"
 #include "menus/sysconfig.h"
 #include "menus/screen_filters.h"
+#include "menus/streaming.h"
 #include "ifile.h"
 #include "memory.h"
 #include "fmt.h"
 
 Menu rosalinaMenu = {
     "Rosalina menu",
-    .nbItems = 11,
+    .nbItems = 12,
     {
+        { "Reboot", METHOD, .method = &RosalinaMenu_Reboot },
+        { "Streaming", MENU, .menu = &streamingMenu },
         { "New 3DS menu...", MENU, .menu = &N3DSMenu },
         { "Cheats...", METHOD, .method = &RosalinaMenu_Cheats },
         { "Process list", METHOD, .method = &RosalinaMenu_ProcessList },
@@ -53,7 +56,7 @@ Menu rosalinaMenu = {
         { "Screen filters...", MENU, .menu = &screenFiltersMenu },
         { "Miscellaneous options...", MENU, .menu = &miscellaneousMenu },
         { "Power off", METHOD, .method = &RosalinaMenu_PowerOff },
-        { "Reboot", METHOD, .method = &RosalinaMenu_Reboot },
+        
         { "Credits", METHOD, .method = &RosalinaMenu_ShowCredits }
     }
 };
