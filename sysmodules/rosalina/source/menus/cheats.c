@@ -24,9 +24,8 @@
  *         reasonable ways as different from the original version.
  */
 
-/* This file was entirely written by Duckbill */
-
 #include <3ds.h>
+#include <stdlib.h>
 #include "menus/cheats.h"
 #include "memory.h"
 #include "draw.h"
@@ -46,19 +45,30 @@ typedef struct CheatProcessInfo
 
 typedef struct CheatDescription
 {
-    u32 active;
-    u32 valid;
-    u32 keyActivated;
-    u32 keyCombo;
-    char name[40];
+    struct {
+        u8 active : 1;
+        u8 valid : 1;
+        u8 hasKeyCode : 1;
+        u8 activeStorage : 1;
+    };
+    char name[39];
     u32 codesCount;
+    u32 storage1;
+    u32 storage2;
     u64 codes[0];
 } CheatDescription;
 
+typedef struct BufferedFile
+{
+    IFile file;
+    u64 curPos;
+    u64 maxPos;
+    char buffer[512];
+} BufferedFile;
+
 CheatDescription* cheats[1024] = { 0 };
-u8 cheatFileBuffer[16384] = { 0 };
-u32 cheatFilePos = 0;
-u8 cheatBuffer[16384] = { 0 };
+u8 cheatBuffer[32768] = { 0 };
+u8 cheatPage[0x1000] = { 0 };
 
 static CheatProcessInfo cheatinfo[0x40] = { 0 };
 
@@ -93,8 +103,18 @@ static s32 Cheats_FetchProcessInfo(void)
 typedef struct CheatState
 {
     u32 index;
-    u32 offset;
-    u32 data;
+    u32 offset1;
+    u32 offset2;
+    u32 data1;
+    u32 data2;
+    struct {
+        u8 activeOffset : 1;
+        u8 activeData : 1;
+        u8 conditionalMode : 3;
+        u8 data1Mode : 1;
+        u8 data2Mode : 1;
+        u8 floatMode : 1;
+    };
     u8 typeELine;
     u8 typeEIdx;
 
@@ -110,8 +130,22 @@ typedef struct CheatState
 
 CheatState cheat_state = { 0 };
 u8 cheatCount = 0;
-u8 hasKeyActivated = 0;
 u64 cheatTitleInfo = -1ULL;
+
+static inline u32* activeOffset()
+{
+    return cheat_state.activeOffset ? &cheat_state.offset2 : &cheat_state.offset1;
+}
+
+static inline u32* activeData()
+{
+    return cheat_state.activeData ? &cheat_state.data2 : &cheat_state.data1;
+}
+
+static inline u32* activeStorage(CheatDescription* desc)
+{
+    return desc->activeStorage ? &desc->storage2 : &desc->storage1;
+}
 
 char failureReason[64];
 
@@ -133,39 +167,63 @@ static u8 ReadWriteBuffer8 = 0;
 
 static bool Cheat_Write8(const Handle processHandle, u32 offset, u8 value)
 {
-    if (Cheat_IsValidAddress(processHandle, cheat_state.offset + offset, 1))
+    u32 addr = *activeOffset() + offset;
+    if (addr >= 0x01E81000 && addr + 1 < 0x01E82000)
+    {
+        cheatPage[addr - 0x01E81000] = value;
+        return true;
+    }
+    if (Cheat_IsValidAddress(processHandle, addr, 1))
     {
         *((u8*) (&ReadWriteBuffer8)) = value;
-        return R_SUCCEEDED(svcWriteProcessMemory(processHandle, &ReadWriteBuffer8, cheat_state.offset + offset, 1));
+        return R_SUCCEEDED(svcWriteProcessMemory(processHandle, &ReadWriteBuffer8, addr, 1));
     }
     return false;
 }
 
 static bool Cheat_Write16(const Handle processHandle, u32 offset, u16 value)
 {
-    if (Cheat_IsValidAddress(processHandle, cheat_state.offset + offset, 2))
+    u32 addr = *activeOffset() + offset;
+    if (addr >= 0x01E81000 && addr + 2 < 0x01E82000)
+    {
+        *(u16*)(cheatPage + addr - 0x01E81000) = value;
+        return true;
+    }
+    if (Cheat_IsValidAddress(processHandle, addr, 2))
     {
         *((u16*) (&ReadWriteBuffer16)) = value;
-        return R_SUCCEEDED(svcWriteProcessMemory(processHandle, &ReadWriteBuffer16, cheat_state.offset + offset, 2));
+        return R_SUCCEEDED(svcWriteProcessMemory(processHandle, &ReadWriteBuffer16, addr, 2));
     }
     return false;
 }
 
 static bool Cheat_Write32(const Handle processHandle, u32 offset, u32 value)
 {
-    if (Cheat_IsValidAddress(processHandle, cheat_state.offset + offset, 4))
+    u32 addr = *activeOffset() + offset;
+    if (addr >= 0x01E81000 && addr + 4 < 0x01E82000)
+    {
+        *(u32*)(cheatPage + addr - 0x01E81000) = value;
+        return true;
+    }
+    if (Cheat_IsValidAddress(processHandle, addr, 4))
     {
         *((u32*) (&ReadWriteBuffer32)) = value;
-        return R_SUCCEEDED(svcWriteProcessMemory(processHandle, &ReadWriteBuffer32, cheat_state.offset + offset, 4));
+        return R_SUCCEEDED(svcWriteProcessMemory(processHandle, &ReadWriteBuffer32, addr, 4));
     }
     return false;
 }
 
 static bool Cheat_Read8(const Handle processHandle, u32 offset, u8* retValue)
 {
-    if (Cheat_IsValidAddress(processHandle, cheat_state.offset + offset, 1))
+    u32 addr = *activeOffset() + offset;
+    if (addr >= 0x01E81000 && addr + 1 < 0x01E82000)
     {
-        Result res = svcReadProcessMemory(&ReadWriteBuffer8, processHandle, cheat_state.offset + offset, 1);
+        *retValue = cheatPage[addr - 0x01E81000];
+        return true;
+    }
+    if (Cheat_IsValidAddress(processHandle, addr, 1))
+    {
+        Result res = svcReadProcessMemory(&ReadWriteBuffer8, processHandle, addr, 1);
         *retValue = *((u8*) (&ReadWriteBuffer8));
         return R_SUCCEEDED(res);
     }
@@ -174,9 +232,15 @@ static bool Cheat_Read8(const Handle processHandle, u32 offset, u8* retValue)
 
 static bool Cheat_Read16(const Handle processHandle, u32 offset, u16* retValue)
 {
-    if (Cheat_IsValidAddress(processHandle, cheat_state.offset + offset, 2))
+    u32 addr = *activeOffset() + offset;
+    if (addr >= 0x01E81000 && addr + 2 < 0x01E82000)
     {
-        Result res = svcReadProcessMemory(&ReadWriteBuffer16, processHandle, cheat_state.offset + offset, 2);
+        *retValue = *(u16*)(cheatPage + addr - 0x01E81000);
+        return true;
+    }
+    if (Cheat_IsValidAddress(processHandle, addr, 2))
+    {
+        Result res = svcReadProcessMemory(&ReadWriteBuffer16, processHandle, addr, 2);
         *retValue = *((u16*) (&ReadWriteBuffer16));
         return R_SUCCEEDED(res);
     }
@@ -185,9 +249,15 @@ static bool Cheat_Read16(const Handle processHandle, u32 offset, u16* retValue)
 
 static bool Cheat_Read32(const Handle processHandle, u32 offset, u32* retValue)
 {
-    if (Cheat_IsValidAddress(processHandle, cheat_state.offset + offset, 4))
+    u32 addr = *activeOffset() + offset;
+    if (addr >= 0x01E81000 && addr + 4 < 0x01E82000)
     {
-        Result res = svcReadProcessMemory(&ReadWriteBuffer32, processHandle, cheat_state.offset + offset, 4);
+        *retValue = *(u32*)(cheatPage + addr - 0x01E81000);
+        return true;
+    }
+    if (Cheat_IsValidAddress(processHandle, addr, 4))
+    {
+        Result res = svcReadProcessMemory(&ReadWriteBuffer32, processHandle, addr, 4);
         *retValue = *((u32*) (&ReadWriteBuffer32));
         return R_SUCCEEDED(res);
     }
@@ -211,12 +281,19 @@ static u8 Cheat_GetNextTypeE(const CheatDescription* cheat)
     return (u8) ((cheat->codes[cheat_state.typeELine] >> (typeEMapping[cheat_state.typeEIdx])) & 0xFF);
 }
 
-static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* const cheat)
+static u32 Cheat_ApplyCheat(const Handle processHandle, CheatDescription* const cheat)
 {
     cheat_state.index = 0;
-    cheat_state.offset = 0;
-    cheat_state.data = 0;
-    cheat_state.index = 0;
+    cheat_state.offset1 = 0;
+    cheat_state.offset2 = 0;
+    cheat_state.data1 = 0;
+    cheat_state.data2 = 0;
+    cheat_state.activeOffset = 0;
+    cheat_state.activeData = 0;
+    cheat_state.conditionalMode = 0;
+    cheat_state.data1Mode = 0;
+    cheat_state.data2Mode = 0;
+    cheat_state.floatMode = 0;
     cheat_state.loopCount = 0;
     cheat_state.loopLine = -1;
     cheat_state.ifStack = 0;
@@ -226,7 +303,7 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
 
     while (cheat_state.index < cheat->codesCount)
     {
-        u32 skipExecution = cheat_state.ifStack & 0x00000001;
+        bool skipExecution = (cheat_state.ifStack & 0x00000001) != 0;
         u32 arg0 = (u32) ((cheat->codes[cheat_state.index] >> 32) & 0x00000000FFFFFFFFULL);
         u32 arg1 = (u32) ((cheat->codes[cheat_state.index]) & 0x00000000FFFFFFFFULL);
         if (arg0 == 0 && arg1 == 0)
@@ -235,6 +312,7 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
         }
         u32 code = ((arg0 >> 28) & 0x0F);
         u32 subcode = ((arg0 >> 24) & 0x0F);
+        u32 codeArg = arg0 & 0x0F;
 
         switch (code)
         {
@@ -272,20 +350,18 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is less than the value YYYYYYYY.
                 // Example: 323D6B28 10000000
             {
-                u32 newSkip;
                 u32 value = 0;
                 if (!Cheat_Read32(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
+
+                cheat_state.ifStack <<= 1;
                 if (value < arg1)
                 {
-                    newSkip = 0;
+                    cheat_state.ifStack |= skipExecution ? 1 : 0;
                 }
                 else
                 {
-                    newSkip = 1;
+                    cheat_state.ifStack |= 1;
                 }
-
-                cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
                 cheat_state.ifCount++;
             }
                 break;
@@ -296,20 +372,18 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is greater than the value YYYYYYYY.
                 // Example: 423D6B28 10000000
             {
-                u32 newSkip;
                 u32 value = 0;
                 if (!Cheat_Read32(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
+                
+                cheat_state.ifStack <<= 1;
                 if (value > arg1)
                 {
-                    newSkip = 0;
+                    cheat_state.ifStack |= skipExecution ? 1 : 0;
                 }
                 else
                 {
-                    newSkip = 1;
+                    cheat_state.ifStack |= 1;
                 }
-
-                cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
                 cheat_state.ifCount++;
             }
                 break;
@@ -320,20 +394,18 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is equal to the value YYYYYYYY.
                 // Example: 523D6B28 10000000
             {
-                u32 newSkip;
                 u32 value = 0;
                 if (!Cheat_Read32(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
+
+                cheat_state.ifStack <<= 1;
                 if (value == arg1)
                 {
-                    newSkip = 0;
+                    cheat_state.ifStack |= skipExecution ? 1 : 0;
                 }
                 else
                 {
-                    newSkip = 1;
+                    cheat_state.ifStack |= 1;
                 }
-
-                cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
                 cheat_state.ifCount++;
             }
                 break;
@@ -344,20 +416,18 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is not equal to the value YYYYYYYY.
                 // Example: 623D6B28 10000000
             {
-                u32 newSkip;
                 u32 value = 0;
                 if (!Cheat_Read32(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
+
+                cheat_state.ifStack <<= 1;
                 if (value != arg1)
                 {
-                    newSkip = 0;
+                    cheat_state.ifStack |= skipExecution ? 1 : 0;
                 }
                 else
                 {
-                    newSkip = 1;
+                    cheat_state.ifStack |= 1;
                 }
-
-                cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
                 cheat_state.ifCount++;
             }
                 break;
@@ -368,21 +438,32 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is less than the value YYYY.
                 // Example: 723D6B28 00005400
             {
-                u32 newSkip;
+                bool newSkip;
                 u16 mask = (u16) ((arg1 >> 16) & 0xFFFF);
                 u16 value = 0;
                 if (!Cheat_Read16(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
-                if ((value & (~mask)) < (arg1 & 0xFFFF))
+                switch (cheat_state.conditionalMode)
                 {
-                    newSkip = 0;
+                    case 0x0:
+                        newSkip = !((value & (~mask)) < (arg1 & 0xFFFF));
+                        break;
+                    case 0x1:
+                        newSkip = !((value & (~mask)) < (*activeData() & (~mask)));
+                        break;
+                    case 0x2:
+                        newSkip = !((*activeData() & (~mask)) < (arg1 & 0xFFFF));
+                        break;
+                    case 0x3:
+                        newSkip = !((*activeStorage(cheat) & (~mask)) < (arg1 & 0xFFFF));
+                        break;
+                    case 0x4:
+                        newSkip = !((*activeData() & (~mask)) < (*activeStorage(cheat) & (~mask)));
+                        break;
+                    default:
+                        return 0;
                 }
-                else
-                {
-                    newSkip = 1;
-                }
-
                 cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
+                cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;
                 cheat_state.ifCount++;
             }
                 break;
@@ -393,21 +474,33 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is greater than the value YYYY.
                 // Example: 823D6B28 00005400
             {
-                u32 newSkip;
+                bool newSkip;
                 u16 mask = (u16) ((arg1 >> 16) & 0xFFFF);
                 u16 value = 0;
                 if (!Cheat_Read16(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
-                if ((value & (~mask)) > (arg1 & 0xFFFF))
+                switch (cheat_state.conditionalMode)
                 {
-                    newSkip = 0;
-                }
-                else
-                {
-                    newSkip = 1;
+                    case 0x0:
+                        newSkip = !((value & (~mask)) > (arg1 & 0xFFFF));
+                        break;
+                    case 0x1:
+                        newSkip = !((value & (~mask)) > (*activeData() & (~mask)));
+                        break;
+                    case 0x2:
+                        newSkip = !((*activeData() & (~mask)) > (arg1 & 0xFFFF));
+                        break;
+                    case 0x3:
+                        newSkip = !((*activeStorage(cheat) & (~mask)) > (arg1 & 0xFFFF));
+                        break;
+                    case 0x4:
+                        newSkip = !((*activeData() & (~mask)) > (*activeStorage(cheat) & (~mask)));
+                        break;
+                    default:
+                        return 0;
                 }
 
                 cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
+                cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;
                 cheat_state.ifCount++;
             }
                 break;
@@ -418,21 +511,33 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is equal to the value YYYY.
                 // Example: 923D6B28 00005400
             {
-                u32 newSkip;
+                bool newSkip;
                 u16 mask = (u16) ((arg1 >> 16) & 0xFFFF);
                 u16 value = 0;
                 if (!Cheat_Read16(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
-                if ((value & (~mask)) == (arg1 & 0xFFFF))
+                switch (cheat_state.conditionalMode)
                 {
-                    newSkip = 0;
-                }
-                else
-                {
-                    newSkip = 1;
+                    case 0x0:
+                        newSkip = !((value & (~mask)) == (arg1 & 0xFFFF));
+                        break;
+                    case 0x1:
+                        newSkip = !((value & (~mask)) == (*activeData() & (~mask)));
+                        break;
+                    case 0x2:
+                        newSkip = !((*activeData() & (~mask)) == (arg1 & 0xFFFF));
+                        break;
+                    case 0x3:
+                        newSkip = !((*activeStorage(cheat) & (~mask)) == (arg1 & 0xFFFF));
+                        break;
+                    case 0x4:
+                        newSkip = !((*activeData() & (~mask)) == (*activeStorage(cheat) & (~mask)));
+                        break;
+                    default:
+                        return 0;
                 }
 
                 cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
+                cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;
                 cheat_state.ifCount++;
             }
                 break;
@@ -443,21 +548,33 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // Simple: If the value at address 0XXXXXXX is not equal to the value YYYY.
                 // Example: A23D6B28 00005400
             {
-                u32 newSkip;
+                bool newSkip;
                 u16 mask = (u16) ((arg1 >> 16) & 0xFFFF);
                 u16 value = 0;
                 if (!Cheat_Read16(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
-                if ((value & (~mask)) != (arg1 & 0xFFFF))
+                switch (cheat_state.conditionalMode)
                 {
-                    newSkip = 0;
-                }
-                else
-                {
-                    newSkip = 1;
+                    case 0x0:
+                        newSkip = !((value & (~mask)) != (arg1 & 0xFFFF));
+                        break;
+                    case 0x1:
+                        newSkip = !((value & (~mask)) != (*activeData() & (~mask)));
+                        break;
+                    case 0x2:
+                        newSkip = !((*activeData() & (~mask)) != (arg1 & 0xFFFF));
+                        break;
+                    case 0x3:
+                        newSkip = !((*activeStorage(cheat) & (~mask)) != (arg1 & 0xFFFF));
+                        break;
+                    case 0x4:
+                        newSkip = !((*activeData() & (~mask)) != (*activeStorage(cheat) & (~mask)));
+                        break;
+                    default:
+                        return 0;
                 }
 
                 cheat_state.ifStack <<= 1;
-                cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
+                cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;
                 cheat_state.ifCount++;
             }
                 break;
@@ -470,7 +587,7 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 {
                     u32 value;
                     if (!Cheat_Read32(processHandle, arg0 & 0x0FFFFFFF, &value)) return 0;
-                    cheat_state.offset = value;
+                    *activeOffset() = value;
                 }
                 break;
             case 0xC:
@@ -485,11 +602,27 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 // 023D6B28 0009896C
                 // DC000000 00000010
                 // D2000000 00000000
-
-                cheat_state.loopLine = cheat_state.index;
-                cheat_state.loopCount = arg1;
-                cheat_state.storedStack = cheat_state.ifStack;
-                cheat_state.storedIfCount = cheat_state.ifCount;
+                switch (subcode)
+                {
+                    case 0x00:
+                        cheat_state.loopLine = cheat_state.index;
+                        cheat_state.loopCount = arg1;
+                        cheat_state.storedStack = cheat_state.ifStack;
+                        cheat_state.storedIfCount = cheat_state.ifCount;
+                        break;
+                    case 0x01:
+                        cheat_state.loopLine = cheat_state.index;
+                        cheat_state.loopCount = cheat_state.data1;
+                        cheat_state.storedStack = cheat_state.ifStack;
+                        cheat_state.storedIfCount = cheat_state.ifCount;
+                        break;
+                    case 0x02:
+                        cheat_state.loopLine = cheat_state.index;
+                        cheat_state.loopCount = cheat_state.data2;
+                        cheat_state.storedStack = cheat_state.ifStack;
+                        cheat_state.storedIfCount = cheat_state.ifCount;
+                        break;
+                }
                 break;
             case 0xD:
                 switch (subcode)
@@ -507,39 +640,55 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // D0000000 00000000
 
                         // The 7 type line would be terminated.
-                        if (cheat_state.loopLine != -1)
+                        if (arg1 == 0)
                         {
-                            if (cheat_state.ifCount > 0 && cheat_state.ifCount > cheat_state.storedIfCount)
+                            if (cheat_state.loopLine != -1)
                             {
-                                cheat_state.ifStack >>= 1;
-                                cheat_state.ifCount--;
-                            }
-                            else
-                            {
-
-                                if (cheat_state.loopCount > 0)
+                                if (cheat_state.ifCount > 0 && cheat_state.ifCount > cheat_state.storedIfCount)
                                 {
-                                    cheat_state.loopCount--;
-                                    if (cheat_state.loopCount == 0)
+                                    cheat_state.ifStack >>= 1;
+                                    cheat_state.ifCount--;
+                                }
+                                else
+                                {
+
+                                    if (cheat_state.loopCount > 0)
                                     {
-                                        cheat_state.loopLine = -1;
-                                    }
-                                    else
-                                    {
-                                        if (cheat_state.loopLine != -1)
+                                        cheat_state.loopCount--;
+                                        if (cheat_state.loopCount == 0)
+                                        {
+                                            cheat_state.loopLine = -1;
+                                        }
+                                        else if (cheat_state.loopLine != -1)
                                         {
                                             cheat_state.index = cheat_state.loopLine;
                                         }
                                     }
                                 }
                             }
-                        }
-                        else
-                        {
-                            if (cheat_state.ifCount > 0)
+                            else
                             {
-                                cheat_state.ifStack >>= 1;
-                                cheat_state.ifCount--;
+                                if (cheat_state.ifCount > 0)
+                                {
+                                    cheat_state.ifStack >>= 1;
+                                    cheat_state.ifCount--;
+                                }
+                            }
+                        }
+                        // D0000000 00000001
+                        // Loop break
+                        else if (!skipExecution && arg1 == 1)
+                        {
+                            cheat_state.loopCount = 0;
+                            cheat_state.loopLine = -1;
+                            cheat_state.index++;
+                            while (cheat_state.index < cheat->codesCount)
+                            {
+                                u64 code = cheat->codes[cheat_state.index++];
+                                if (code == 0xD100000000000000ull || code == 0xD200000000000000ull)
+                                {
+                                    break;
+                                }
                             }
                         }
                         break;
@@ -591,32 +740,41 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // D2000000 00000000
 
                         // All lines would terminate.
-                        if (cheat_state.loopCount > 0)
+                        if (arg1 == 0)
                         {
-                            cheat_state.loopCount--;
-                            if (cheat_state.loopCount == 0)
+                            if (cheat_state.loopCount > 0)
                             {
-                                cheat_state.data = 0;
-                                cheat_state.offset = 0;
-                                cheat_state.loopLine = -1;
+                                cheat_state.loopCount--;
+                                if (cheat_state.loopCount == 0)
+                                {
+                                    *activeData() = 0;
+                                    *activeOffset() = 0;
+                                    cheat_state.loopLine = -1;
 
-                                cheat_state.ifStack = 0;
-                                cheat_state.ifCount = 0;
+                                    cheat_state.ifStack = 0;
+                                    cheat_state.ifCount = 0;
+                                }
+                                else
+                                {
+                                    if (cheat_state.loopLine != -1)
+                                    {
+                                        cheat_state.index = cheat_state.loopLine;
+                                    }
+                                }
                             }
                             else
                             {
-                                if (cheat_state.loopLine != -1)
-                                {
-                                    cheat_state.index = cheat_state.loopLine;
-                                }
+                                *activeData() = 0;
+                                *activeOffset() = 0;
+                                cheat_state.ifStack = 0;
+                                cheat_state.ifCount = 0;
                             }
                         }
-                        else
+                        // D2000000 00000001
+                        // Return
+                        else if (!skipExecution && arg1 == 1)
                         {
-                            cheat_state.data = 0;
-                            cheat_state.offset = 0;
-                            cheat_state.ifStack = 0;
-                            cheat_state.ifCount = 0;
+                            cheat_state.index = cheat->codesCount;
                         }
                         break;
                     case 0x03:
@@ -628,7 +786,14 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D3000000 023D6B28
                         if (!skipExecution)
                         {
-                            cheat_state.offset = arg1;
+                            if (codeArg == 0)
+                            {
+                                cheat_state.offset1 = arg1;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                cheat_state.offset2 = arg1;
+                            }
                         }
                         break;
                     case 0x04:
@@ -640,7 +805,18 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D4000000 00000025
                         if (!skipExecution)
                         {
-                            cheat_state.data += arg1;
+                            if (codeArg == 0)
+                            {
+                                *activeData() += arg1;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                cheat_state.data1 += arg1 + cheat_state.data2;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                cheat_state.data2 += arg1 + cheat_state.data1;
+                            }
                         }
                         break;
                     case 0x05:
@@ -652,7 +828,18 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D5000000 34540099
                         if (!skipExecution)
                         {
-                            cheat_state.data = arg1;
+                            if (codeArg == 0)
+                            {
+                                *activeData() = arg1;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                cheat_state.data1 = arg1;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                cheat_state.data2 = arg1;
+                            }
                         }
                         break;
                     case 0x06:
@@ -664,8 +851,21 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D3000000 023D6B28
                         if (!skipExecution)
                         {
-                            if (!Cheat_Write32(processHandle, arg1, cheat_state.data)) return 0;
-                            cheat_state.offset += 4;
+                            if (codeArg == 0)
+                            {
+                                if (!Cheat_Write32(processHandle, arg1, *activeData())) return 0;
+                                *activeOffset() += 4;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                if (!Cheat_Write32(processHandle, arg1, cheat_state.data1)) return 0;
+                                *activeOffset() += 4;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                if (!Cheat_Write32(processHandle, arg1, cheat_state.data2)) return 0;
+                                *activeOffset() += 4;
+                            }
                         }
                         break;
                     case 0x07:
@@ -677,8 +877,21 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D7000000 023D6B28
                         if (!skipExecution)
                         {
-                            if (!Cheat_Write16(processHandle, arg1, (u16) (cheat_state.data & 0xFFFF))) return 0;
-                            cheat_state.offset += 2;
+                            if (codeArg == 0)
+                            {
+                                if (!Cheat_Write16(processHandle, arg1, (u16) (*activeData() & 0xFFFF))) return 0;
+                                *activeOffset() += 2;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                if (!Cheat_Write16(processHandle, arg1, (u16) (cheat_state.data1 & 0xFFFF))) return 0;
+                                *activeOffset() += 2;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                if (!Cheat_Write16(processHandle, arg1, (u16) (cheat_state.data2 & 0xFFFF))) return 0;
+                                *activeOffset() += 2;
+                            }
                         }
                         break;
                     case 0x08:
@@ -690,8 +903,21 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D8000000 023D6B28
                         if (!skipExecution)
                         {
-                            if (!Cheat_Write8(processHandle, arg1, (u8) (cheat_state.data & 0xFF))) return 0;
-                            cheat_state.offset += 1;
+                            if (codeArg == 0)
+                            {
+                                if (!Cheat_Write8(processHandle, arg1, (u8) (*activeData() & 0xFF))) return 0;
+                                *activeOffset() += 1;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                if (!Cheat_Write8(processHandle, arg1, (u8) (cheat_state.data1 & 0xFF))) return 0;
+                                *activeOffset() += 1;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                if (!Cheat_Write8(processHandle, arg1, (u8) (cheat_state.data2 & 0xFF))) return 0;
+                                *activeOffset() += 1;
+                            }
                         }
                         break;
                     case 0x09:
@@ -703,9 +929,24 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: D9000000 023D6B28
                         if (!skipExecution)
                         {
-                            u32 value = 0;
-                            if (!Cheat_Read32(processHandle, arg1, &value)) return 0;
-                            cheat_state.data = value;
+                            if (codeArg == 0)
+                            {
+                                u32 value = 0;
+                                if (!Cheat_Read32(processHandle, arg1, &value)) return 0;
+                                *activeData() = value;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                u32 value = 0;
+                                if (!Cheat_Read32(processHandle, arg1, &value)) return 0;
+                                cheat_state.data1 = value;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                u32 value = 0;
+                                if (!Cheat_Read32(processHandle, arg1, &value)) return 0;
+                                cheat_state.data2 = value;
+                            }
                         }
                         break;
                     case 0x0A:
@@ -717,9 +958,24 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: DA000000 023D6B28
                         if (!skipExecution)
                         {
-                            u16 value = 0;
-                            if (!Cheat_Read16(processHandle, arg1, &value)) return 0;
-                            cheat_state.data = value;
+                            if (codeArg == 0)
+                            {
+                                u16 value = 0;
+                                if (!Cheat_Read16(processHandle, arg1, &value)) return 0;
+                                *activeData() = value;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                u16 value = 0;
+                                if (!Cheat_Read16(processHandle, arg1, &value)) return 0;
+                                cheat_state.data1 = value;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                u16 value = 0;
+                                if (!Cheat_Read16(processHandle, arg1, &value)) return 0;
+                                cheat_state.data2 = value;
+                            }
                         }
                         break;
                     case 0x0B:
@@ -731,9 +987,24 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: DB000000 023D6B28
                         if (!skipExecution)
                         {
-                            u8 value = 0;
-                            if (!Cheat_Read8(processHandle, arg1, &value)) return 0;
-                            cheat_state.data = value;
+                            if (codeArg == 0)
+                            {
+                                u8 value = 0;
+                                if (!Cheat_Read8(processHandle, arg1, &value)) return 0;
+                                *activeData() = value;
+                            }
+                            else if (codeArg == 1)
+                            {
+                                u8 value = 0;
+                                if (!Cheat_Read8(processHandle, arg1, &value)) return 0;
+                                cheat_state.data1 = value;
+                            }
+                            else if (codeArg == 2)
+                            {
+                                u8 value = 0;
+                                if (!Cheat_Read8(processHandle, arg1, &value)) return 0;
+                                cheat_state.data2 = value;
+                            }
                         }
                         break;
                     case 0x0C:
@@ -745,25 +1016,226 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                         // Example: DC000000 00000100
                         if (!skipExecution)
                         {
-                            cheat_state.offset += arg1;
+                            *activeOffset() += arg1;
                         }
                         break;
                     case 0x0D:
                         // DD Type
                     {
-                        u32 newSkip;
-                        if (arg1 == 0 || (HID_PAD & arg1) == arg1)
+                        bool newSkip = !(arg1 == 0 || (HID_PAD & arg1) == arg1);
+
+                        cheat_state.ifStack <<= 1;
+                        cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;;
+                        cheat_state.ifCount++;
+                    }
+                        break;
+                    case 0x0E:
+                        // Touchpad conditional
+                        // DE000000 AAAABBBB: AAAA >= X position >= BBBB
+                        // DE000001 AAAABBBB: AAAA >= Y position >= BBBB
+                    {
+                        bool newSkip;
+                        u32 highBound = arg1 >> 16;
+                        u32 lowBound = arg1 & 0xFFFF;
+                        touchPosition touch;
+                        hidTouchRead(&touch);
+                        if (codeArg == 0)
                         {
-                            newSkip = 0;
+                            newSkip = !(lowBound <= touch.px && highBound >= touch.px);
+                        }
+                        else if (codeArg == 1)
+                        {
+                            newSkip = !(lowBound <= touch.py && highBound >= touch.py);
                         }
                         else
                         {
-                            newSkip = 1;
+                            return 0;
                         }
 
                         cheat_state.ifStack <<= 1;
-                        cheat_state.ifStack |= ((newSkip | skipExecution) & 0x1);
+                        cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;
                         cheat_state.ifCount++;
+                    }
+                        break;
+                    case 0x0F:
+                    {
+                        switch (codeArg)
+                        {
+                            case 0x00:
+                            {
+                                if (arg1 & 0x00010000)
+                                {
+                                    if (arg1 & 0x1)
+                                    {
+                                        cheat_state.offset2 = cheat_state.offset1;
+                                    }
+                                    else
+                                    {
+                                        cheat_state.offset1 = cheat_state.offset2;
+                                    }
+                                }
+                                else if (arg1 & 0x00020000)
+                                {
+                                    if (arg1 & 0x1)
+                                    {
+                                        cheat_state.data2 = cheat_state.offset2;
+                                    }
+                                    else
+                                    {
+                                        cheat_state.data1 = cheat_state.offset1;
+                                    }
+                                }
+                                else
+                                {
+                                    cheat_state.activeOffset = arg1 & 0x1;
+                                }
+                            }
+                                break;
+                            case 0x01:
+                            {
+                                if (arg1 & 0x00010000)
+                                {
+                                    if (arg1 & 0x1)
+                                    {
+                                        cheat_state.data2 = cheat_state.data1;
+                                    }
+                                    else
+                                    {
+                                        cheat_state.data1 = cheat_state.data2;
+                                    }
+                                }
+                                else if (arg1 & 0x00020000)
+                                {
+                                    if (arg1 & 0x1)
+                                    {
+                                        cheat_state.offset2 = cheat_state.data2;
+                                    }
+                                    else
+                                    {
+                                        cheat_state.offset1 = cheat_state.data1;
+                                    }
+                                }
+                                else
+                                {
+                                    cheat_state.activeData = arg1 & 0x1;
+                                }
+                            }
+                                break;
+                            case 0x02:
+                            {
+                                if (arg1 & 0x00010000)
+                                {
+                                    if (arg1 & 0x1)
+                                    {
+                                        cheat_state.data2 = cheat->storage2;
+                                    }
+                                    else
+                                    {
+                                        cheat_state.data1 = cheat->storage1;
+                                    }
+                                }
+                                else if (arg1 & 0x00020000)
+                                {
+                                    if (arg1 & 0x1)
+                                    {
+                                        cheat->storage2 = cheat_state.data2;
+                                    }
+                                    else
+                                    {
+                                        cheat->storage1 = cheat_state.data1;
+                                    }
+                                }
+                                else
+                                {
+                                    cheat->activeStorage = arg1 & 0x1;
+                                }
+                            }
+                                break;
+                            case 0x0E:
+                            {
+                                if (cheat_state.activeData)
+                                {
+                                    switch (arg1)
+                                    {
+                                        case 0x0:
+                                        {
+                                            cheat_state.data2Mode = 0;
+                                        }
+                                            break;
+                                        case 0x1:
+                                        {
+                                            cheat_state.data2Mode = 1;
+                                        }
+                                            break;
+                                        case 0x10:
+                                        {
+                                            cheat_state.data2Mode = 0;
+                                            float val;
+                                            memcpy(&val, &cheat_state.data2, sizeof(float));
+                                            cheat_state.data2 = val;
+                                        }
+                                            break;
+                                        case 0x11:
+                                        {
+                                            cheat_state.data2Mode = 1;
+                                            float val = cheat_state.data2;
+                                            memcpy(&cheat_state.data2, &val, sizeof(float));
+                                        }
+                                            break;
+                                        default:
+                                            return 0;
+                                    }
+                                }
+                                else
+                                {
+                                    switch (arg1)
+                                    {
+                                        case 0x0:
+                                        {
+                                            cheat_state.data1Mode = 0;
+                                        }
+                                            break;
+                                        case 0x1:
+                                        {
+                                            cheat_state.data1Mode = 1;
+                                        }
+                                            break;
+                                        case 0x10:
+                                        {
+                                            cheat_state.data1Mode = 0;
+                                            float val;
+                                            memcpy(&val, &cheat_state.data1, sizeof(float));
+                                            cheat_state.data1 = val;
+                                        }
+                                            break;
+                                        case 0x11:
+                                        {
+                                            cheat_state.data1Mode = 1;
+                                            float val = cheat_state.data1;
+                                            memcpy(&cheat_state.data1, &val, sizeof(float));
+                                        }
+                                            break;
+                                        default:
+                                            return 0;
+                                    }
+                                }
+                            }
+                                break;
+                            case 0x0F:
+                            {
+                                if (arg1 < 5)
+                                {
+                                    cheat_state.conditionalMode = (u8)arg1;
+                                }
+                                else
+                                {
+                                    return 0;
+                                }
+                            }
+                                break;
+                            default:
+                                return 0;
+                        }
                     }
                         break;
                     default:
@@ -794,6 +1266,263 @@ static u32 Cheat_ApplyCheat(const Handle processHandle, const CheatDescription* 
                 cheat_state.index = cheat_state.typeELine;
             }
                 break;
+            case 0xF:
+            {
+                if (arg0 == 0xF0F00000)
+                {
+                    // I have no clue how to implement this, or if it's even possible. Needs research.
+                    return 0;
+                }
+                else
+                {
+                    switch (subcode)
+                    {
+                        case 0x0:
+                        {
+                            cheat_state.floatMode = arg1 & 0x1;
+                        }
+                            break;
+                        case 0x1:
+                        {
+                            if (cheat_state.floatMode)
+                            {
+                                u32 tmp;
+                                if (!Cheat_Read32(processHandle, arg0 & 0x00FFFFFF, &tmp))
+                                {
+                                    return 0;
+                                }
+                                float value;
+                                memcpy(&value, &tmp, sizeof(float));
+                                value += arg1;
+                                memcpy(&tmp, &value, sizeof(u32));
+                                if (!Cheat_Write32(processHandle, arg0 & 0x00FFFFFF, tmp))
+                                {
+                                    return 0;
+                                }
+                            }
+                            else
+                            {
+                                u32 tmp;
+                                if (!Cheat_Read32(processHandle, arg0 & 0x00FFFFFF, &tmp))
+                                {
+                                    return 0;
+                                }
+                                tmp += arg1;
+                                if (!Cheat_Write32(processHandle, arg0 & 0x00FFFFFF, tmp))
+                                {
+                                    return 0;
+                                }
+                            }
+                        }
+                            break;
+                        case 0x2:
+                        {
+                            if (cheat_state.floatMode)
+                            {
+                                u32 tmp;
+                                if (!Cheat_Read32(processHandle, arg0 & 0x00FFFFFF, &tmp))
+                                {
+                                    return 0;
+                                }
+                                float value;
+                                memcpy(&value, &tmp, sizeof(float));
+                                value *= arg1;
+                                memcpy(&tmp, &value, sizeof(u32));
+                                if (!Cheat_Write32(processHandle, arg0 & 0x00FFFFFF, tmp))
+                                {
+                                    return 0;
+                                }
+                            }
+                            else
+                            {
+                                u32 tmp;
+                                if (!Cheat_Read32(processHandle, arg0 & 0x00FFFFFF, &tmp))
+                                {
+                                    return 0;
+                                }
+                                tmp *= arg1;
+                                if (!Cheat_Write32(processHandle, arg0 & 0x00FFFFFF, tmp))
+                                {
+                                    return 0;
+                                }
+                            }
+                        }
+                            break;
+                        case 0x3:
+                        {
+                            if (cheat_state.floatMode)
+                            {
+                                u32 tmp;
+                                if (!Cheat_Read32(processHandle, arg0 & 0x00FFFFFF, &tmp))
+                                {
+                                    return 0;
+                                }
+                                float value;
+                                memcpy(&value, &tmp, sizeof(float));
+                                value /= arg1;
+                                memcpy(&tmp, &value, sizeof(u32));
+                                if (!Cheat_Write32(processHandle, arg0 & 0x00FFFFFF, tmp))
+                                {
+                                    return 0;
+                                }
+                            }
+                            else
+                            {
+                                u32 tmp;
+                                if (!Cheat_Read32(processHandle, arg0 & 0x00FFFFFF, &tmp))
+                                {
+                                    return 0;
+                                }
+                                tmp /= arg1;
+                                if (!Cheat_Write32(processHandle, arg0 & 0x00FFFFFF, tmp))
+                                {
+                                    return 0;
+                                }
+                            }
+                        }
+                            break;
+                        case 0x4:
+                        {
+                            if (cheat_state.data1Mode)
+                            {
+                                float value;
+                                memcpy(&value, activeData(), sizeof(float));
+                                value *= arg1;
+                                memcpy(activeData(), &value, sizeof(float));
+                            }
+                            else
+                            {
+                                *activeData() *= arg1;
+                            }
+                        }
+                            break;
+                        case 0x5:
+                        {
+                            if (cheat_state.data1Mode)
+                            {
+                                float value;
+                                memcpy(&value, activeData(), sizeof(float));
+                                value /= arg1;
+                                memcpy(activeData(), &value, sizeof(float));
+                            }
+                            else
+                            {
+                                *activeData() /= arg1;
+                            }
+                        }
+                            break;
+                        case 0x6:
+                        {
+                            *activeData() &= arg1;
+                        }
+                            break;
+                        case 0x7:
+                        {
+                            *activeData() |= arg1;
+                        }
+                            break;
+                        case 0x8:
+                        {
+                            *activeData() ^= arg1;
+                        }
+                            break;
+                        case 0x9:
+                        {
+                            *activeData() = ~*activeData();
+                        }
+                            break;
+                        case 0xA:
+                        {
+                            *activeData() <<= arg1;
+                        }
+                            break;
+                        case 0xB:
+                        {
+                            *activeData() >>= arg1;
+                        }
+                            break;
+                        case 0xC:
+                        {
+                            u8 origActiveOffset = cheat_state.activeOffset;
+                            for (size_t i = 0; i < arg1; i++)
+                            {
+                                u8 data;
+                                cheat_state.activeOffset = 1;
+                                if (!Cheat_Read8(processHandle, 0, &data))
+                                {
+                                    return 0;
+                                }
+                                cheat_state.activeOffset = 0;
+                                if (!Cheat_Write8(processHandle, 0, data))
+                                {
+                                    return 0;
+                                }
+                            }
+                            cheat_state.activeOffset = origActiveOffset;
+                        }
+                            break;
+                        // Search for pattern
+                        case 0xE:
+                        {
+                            u32 searchSize = arg0 & 0xFFFF;
+                            if (searchSize <= arg1 && searchSize + cheat_state.index < cheat->codesCount)
+                            {
+                                bool newSkip = true;
+                                if (!skipExecution) // Don't do an expensive operation if we don't have to
+                                {
+                                    u8* searchData = (u8*)(cheat->codes + cheat_state.index + 1);
+                                    cheat_state.index += searchSize / 8;
+                                    if (searchSize & 0x7)
+                                    {
+                                        cheat_state.index++;
+                                    }
+                                    for (size_t i = 0; i < arg1 - searchSize; i++)
+                                    {
+                                        u8 curVal;
+                                        newSkip = false;
+                                        for (size_t j = 0; j < searchSize; j++)
+                                        {
+                                            if (!Cheat_Read8(processHandle, i + j, &curVal))
+                                            {
+                                                return 0;
+                                            }
+                                            if (curVal != searchData[j])
+                                            {
+                                                newSkip = 1;
+                                                break;
+                                            }
+                                        }
+                                        if (!newSkip)
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                cheat_state.ifStack <<= 1;
+                                cheat_state.ifStack |= (newSkip || skipExecution) ? 1 : 0;
+                                cheat_state.ifCount++;
+                            }
+                            else
+                            {
+                                return 0;
+                            }
+                        }
+                            break;
+                        case 0xF:
+                        {
+                            u32 range = arg1 - (arg0 & 0xFFFFFF);
+                            u32 number = rand() % range;
+                            *activeData() = (arg0 & 0xFFFFFF) + number;
+                        }
+                            break;
+                        default:
+                            return 0;
+                    }
+                }
+            }
+                break;
+            // This should now not be possible
             default:
                 return 0;
         }
@@ -840,6 +1569,7 @@ static Result Cheat_MapMemoryAndApplyCheat(u32 pid, CheatDescription* const chea
         }
         else
         {
+            sprintf(failureReason, "Debug process failed");
             svcCloseHandle(processHandle);
         }
     }
@@ -865,8 +1595,9 @@ static CheatDescription* Cheat_AllocCheat()
     cheat->active = 0;
     cheat->valid = 1;
     cheat->codesCount = 0;
-    cheat->keyActivated = 0;
-    cheat->keyCombo = 0;
+    cheat->hasKeyCode = 0;
+    cheat->storage1 = 0;
+    cheat->storage2 = 0;
     cheat->name[0] = '\0';
 
     cheats[cheatCount] = cheat;
@@ -883,35 +1614,95 @@ static void Cheat_AddCode(CheatDescription* cheat, u64 code)
     }
 }
 
-static Result Cheat_ReadLine(char* line)
+static Result BufferedFile_Open(BufferedFile* file, FS_ArchiveID archiveId, FS_Path archivePath, FS_Path filePath, u32 flags)
+{
+    Result res = 0;
+    memset(file->buffer, '\0', sizeof(file->buffer));
+    res = IFile_Open(&file->file, archiveId, archivePath, filePath, flags);
+    if (R_SUCCEEDED(res))
+    {
+        file->curPos = 0;
+        res = IFile_Read(&file->file, &file->maxPos, file->buffer, sizeof(file->buffer));
+    }
+    return res;
+}
+
+static Result BufferedFile_Read(BufferedFile* file, u64* totalRead, void* buffer, u32 len)
+{
+    Result res = 0;
+    if (len == 0)
+    {
+        *totalRead = 0;
+        return 0;
+    }
+    else if (file->curPos + len < file->maxPos)
+    {
+        memcpy(buffer, file->buffer + file->curPos, len);
+        file->curPos += len;
+        *totalRead = len;
+    }
+    else
+    {
+        *totalRead = 0;
+        while(R_SUCCEEDED(res) && file->maxPos != 0 && *totalRead < len)
+        {
+            u32 toRead = file->maxPos - file->curPos < len - *totalRead ? file->maxPos - file->curPos : len - *totalRead;
+            memcpy(buffer + *totalRead, file->buffer + file->curPos, toRead);
+            *totalRead += toRead;
+            file->curPos += toRead;
+            if (file->curPos >= file->maxPos)
+            {
+                res = IFile_Read(&file->file, &file->maxPos, file->buffer, sizeof(file->buffer));
+                file->curPos = 0;
+            }
+        }
+    }
+    return res;
+}
+
+static Result Cheat_ReadLine(BufferedFile* file, char* line, u32 lineSize)
 {
     Result res = 0;
 
-    char c = '\0';
     u32 idx = 0;
-    while (R_SUCCEEDED(res))
+    u64 total = 0;
+    bool lastWasCarriageReturn = false;
+    while (R_SUCCEEDED(res) && idx < lineSize)
     {
-        c = cheatFileBuffer[cheatFilePos++];
-        res = c ? 0 : -1;
-        if (R_SUCCEEDED(res) && c != '\0')
+        res = BufferedFile_Read(file, &total, line + idx, 1);
+        if (total == 0)
         {
-            if (c == '\n' || c == '\r' || idx >= 1023)
+            line[idx] = '\0';
+            return -1;
+        }
+        if (R_SUCCEEDED(res))
+        {
+            if (line[idx] == '\r')
             {
-                line[idx++] = '\0';
-                return idx;
+                lastWasCarriageReturn = true;
+            }
+            else if (line[idx] == '\n')
+            {
+                if (lastWasCarriageReturn)
+                {
+                    line[--idx] = '\0';
+                    return idx;
+                }
+                else
+                {
+                    line[idx] = '\0';
+                    return idx;
+                }
+            }
+            else if (line[idx] == '\0')
+            {
+                return -1;
             }
             else
             {
-                line[idx++] = c;
+                lastWasCarriageReturn = false;
             }
-        }
-        else
-        {
-            if (idx > 0)
-            {
-                line[idx++] = '\0';
-                return idx;
-            }
+            idx++;
         }
     }
     return res;
@@ -998,98 +1789,101 @@ static u64 Cheat_GetCode(const char *line)
     return tmp;
 }
 
+static char* stripWhitespace(char* in)
+{
+    char* ret = in;
+    while (*ret == ' ' || *ret == '\t')
+    {
+        ret++;
+    }
+    int back = strlen(ret) - 1;
+    while (back > 0 && (ret[back] == ' ' || ret[back] == '\t'))
+    {
+        back--;
+    }
+    ret[back+1] = '\0';
+    return ret;
+}
+
 static void Cheat_LoadCheatsIntoMemory(u64 titleId)
 {
     cheatCount = 0;
     cheatTitleInfo = titleId;
-    hasKeyActivated = 0;
 
     char path[64] = { 0 };
     sprintf(path, "/luma/titles/%016llX/cheats.txt", titleId);
 
-    IFile file;
+    BufferedFile file;
 
-    if (R_FAILED(IFile_Open(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, path), FS_OPEN_READ)))
+    if (R_FAILED(BufferedFile_Open(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, path), FS_OPEN_READ)))
     {
         // OK, let's try another source
         sprintf(path, "/cheats/%016llX.txt", titleId);
-        if (R_FAILED(IFile_Open(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, path), FS_OPEN_READ))) return;
+        if (R_FAILED(BufferedFile_Open(&file, ARCHIVE_SDMC, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, path), FS_OPEN_READ))) return;
     };
-
-    u64 fileLen = 0;
-    IFile_GetSize(&file, &fileLen);
-    if (fileLen > 16383)
-    {
-        fileLen = 16383;
-    }
-
-    u64 total;
-    IFile_Read(&file, &total, cheatFileBuffer, fileLen);
-    IFile_Close(&file);
-    for (int i = fileLen; i < 16384; i++)
-    {
-        cheatFileBuffer[i] = 0;
-    }
 
     char line[1024] = { 0 };
     Result res = 0;
     CheatDescription* cheat = 0;
-    cheatFilePos = 0;
+    u32 cheatSize = 0;
     do
     {
-        res = Cheat_ReadLine(line);
+        res = Cheat_ReadLine(&file, line, 1024);
         if (R_SUCCEEDED(res))
         {
-            s32 lineLen = strnlen(line, 1023);
+            char* strippedLine = stripWhitespace(line);
+            s32 lineLen = strnlen(strippedLine, 1023);
             if (!lineLen)
             {
                 continue;
             }
-            if (line[0] == '#')
+            if (strippedLine[0] == '#')
             {
                 continue;
             }
-            if (Cheat_IsCodeLine(line))
+            if (Cheat_IsCodeLine(strippedLine))
             {
+                if (cheatSize + sizeof(u64) >= sizeof(cheatBuffer))
+                {
+                    cheatCount--;
+                    break;
+                }
                 if (cheat)
                 {
-                    u64 tmp = Cheat_GetCode(line);
+                    u64 tmp = Cheat_GetCode(strippedLine);
                     Cheat_AddCode(cheat, tmp);
+                    cheatSize += sizeof(u64);
                     if (((tmp >> 32) & 0xFFFFFFFF) == 0xDD000000)
                     {
-                        if (tmp & 0xFFFFFFFF)
-                        {
-                            // Not empty key code
-                            cheat->keyCombo |= (tmp & 0xFFF);
-                            cheat->keyActivated = 1;
-                        }
+                        cheat->hasKeyCode = 1;
                     }
                 }
             }
             else
             {
-                if (!cheat)
+                if (!cheat || cheat->codesCount > 0)
                 {
-                    cheat = Cheat_AllocCheat();
-                }
-                else
-                {
-                    if (cheat->codesCount > 0)
+                    if (cheatSize + sizeof(CheatDescription) >= sizeof(cheatBuffer))
                     {
-                        // Add new cheat only if previous has body. In other case just rewrite it's name
-                        cheat = Cheat_AllocCheat();
+                        break;
                     }
+                    cheat = Cheat_AllocCheat();
+                    cheatSize += sizeof(CheatDescription);
                 }
                 strncpy(cheat->name, line, 38);
                 cheat->name[38] = '\0';
             }
         }
-    } while (R_SUCCEEDED(res));
+    } while (R_SUCCEEDED(res) && cheatSize < sizeof(cheatBuffer));
+
+    IFile_Close(&file.file);
 
     if ((cheatCount > 0) && (cheats[cheatCount - 1]->codesCount == 0))
     {
         cheatCount--; // Remove last empty cheat
     }
+
+    memset(cheatPage, 0, 0x1000);
 }
 
 static u32 Cheat_GetCurrentPID(u64* titleId)
@@ -1134,28 +1928,21 @@ void Cheat_ApplyCheats(void)
     if (!titleId)
     {
         cheatCount = 0;
-        hasKeyActivated = 0;
         return;
     }
 
     if (titleId != cheatTitleInfo)
     {
         cheatCount = 0;
-        hasKeyActivated = 0;
         return;
     }
 
-    u32 keys = HID_PAD & 0xFFF;
     for (int i = 0; i < cheatCount; i++)
     {
-        if (cheats[i]->active && !(cheats[i]->keyActivated))
+        if (cheats[i]->active)
         {
             Cheat_MapMemoryAndApplyCheat(pid, cheats[i]);
         } 
-        else if (cheats[i]->active && cheats[i]->keyActivated && (cheats[i]->keyCombo & keys) == keys)
-        {
-            Cheat_MapMemoryAndApplyCheat(pid, cheats[i]);    
-        }
     }
 }
 
@@ -1217,7 +2004,7 @@ void RosalinaMenu_Cheats(void)
                     char buf[65] = { 0 };
                     s32 j = page * CHEATS_PER_MENU_PAGE + i;
                     const char * checkbox = (cheats[j]->active ? "(x) " : "( ) ");
-                    const char * keyAct = (cheats[j]->keyActivated ? "*" : " ");
+                    const char * keyAct = (cheats[j]->hasKeyCode ? "*" : " ");
                     sprintf(buf, "%s%s%s", checkbox, keyAct, cheats[j]->name);
 
                     Draw_DrawString(30, 30 + i * SPACING_Y, cheats[j]->valid ? COLOR_WHITE : COLOR_RED, buf);
@@ -1252,15 +2039,6 @@ void RosalinaMenu_Cheats(void)
                 else
                 {
                     r = Cheat_MapMemoryAndApplyCheat(pid, cheats[selected]);
-                }
-                hasKeyActivated = 0;
-                for (int i = 0; i < cheatCount; i++)
-                {
-                    if (cheats[i]->active && cheats[i]->keyActivated)
-                    {
-                        hasKeyActivated = 1;
-                        break;
-                    }
                 }
             }
             else if (pressed & BUTTON_DOWN)

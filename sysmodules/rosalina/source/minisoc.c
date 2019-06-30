@@ -1,27 +1,8 @@
 /*
-*   This file is part of Luma3DS
+*   This file is part of Luma3DS.
 *   Copyright (C) 2016-2019 Aurora Wright, TuxSH
 *
-*   This program is free software: you can redistribute it and/or modify
-*   it under the terms of the GNU General Public License as published by
-*   the Free Software Foundation, either version 3 of the License, or
-*   (at your option) any later version.
-*
-*   This program is distributed in the hope that it will be useful,
-*   but WITHOUT ANY WARRANTY; without even the implied warranty of
-*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*   GNU General Public License for more details.
-*
-*   You should have received a copy of the GNU General Public License
-*   along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*   Additional Terms 7.b and 7.c of GPLv3 apply to this file:
-*       * Requiring preservation of specified reasonable legal notices or
-*         author attributions in that material or in the Appropriate Legal
-*         Notices displayed by works containing it.
-*       * Prohibiting misrepresentation of the origin of that material,
-*         or requiring that modified versions of such material be marked in
-*         reasonable ways as different from the original version.
+*   SPDX-License-Identifier: (MIT OR GPL-2.0-or-later)
 */
 
 #include "minisoc.h"
@@ -331,6 +312,47 @@ int socAccept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
     return ret;
 }
 
+int socConnect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
+{
+    int ret = 0;
+    socklen_t tmp_addrlen = 0;
+    u32 *cmdbuf = getThreadCommandBuffer();
+    u8 tmpaddr[0x1c];
+
+    memset(tmpaddr, 0, 0x1c);
+
+    if(addr->sa_family == AF_INET)
+        tmp_addrlen = 8;
+    else
+        tmp_addrlen = 0x1c;
+
+    if(addrlen < tmp_addrlen)
+        return -1;
+
+    tmpaddr[0] = tmp_addrlen;
+    tmpaddr[1] = addr->sa_family;
+    memcpy(&tmpaddr[2], &addr->sa_data, tmp_addrlen-2);
+
+    cmdbuf[0] = IPC_MakeHeader(0x6,2,4); // 0x60084
+    cmdbuf[1] = (u32)sockfd;
+    cmdbuf[2] = (u32)addrlen;
+    cmdbuf[3] = IPC_Desc_CurProcessId();
+    cmdbuf[5] = IPC_Desc_StaticBuffer(tmp_addrlen,0);
+    cmdbuf[6] = (u32)tmpaddr;
+
+    ret = svcSendSyncRequest(SOCU_handle);
+    if(ret != 0) return -1;
+
+    ret = (int)cmdbuf[1];
+    if(ret == 0)
+        ret = _net_convert_error(cmdbuf[2]);
+
+    if(ret < 0)
+        return -1;
+
+    return 0;
+}
+
 int socPoll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
     int ret = 0;
@@ -373,11 +395,6 @@ int socPoll(struct pollfd *fds, nfds_t nfds, int timeout)
     ret = (int)cmdbuf[1];
     if(ret == 0)
         ret = _net_convert_error(cmdbuf[2]);
-
-    if(ret < 0) {
-        //errno = -ret;
-        return -1;
-    }
 
     return ret;
 }
