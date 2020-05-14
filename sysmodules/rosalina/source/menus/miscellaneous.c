@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2019 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -32,7 +32,7 @@
 #include "draw.h"
 #include "hbloader.h"
 #include "fmt.h"
-#include "utils.h" // for makeARMBranch
+#include "utils.h" // for makeArmBranch
 #include "minisoc.h"
 #include "ifile.h"
 #include "pmdbgext.h"
@@ -52,16 +52,17 @@ Menu miscellaneousMenu = {
 void MiscellaneousMenu_SwitchBoot3dsxTargetTitle(void)
 {
     Result res;
-    u64 titleId = 0;
     char failureReason[64];
 
     if(HBLDR_3DSX_TID == HBLDR_DEFAULT_3DSX_TID)
     {
+        FS_ProgramInfo progInfo;
         u32 pid;
-        res = PMDBG_GetCurrentAppTitleIdAndPid(&titleId, &pid);
+        u32 launchFlags;
+        res = PMDBG_GetCurrentAppInfo(&progInfo, &pid, &launchFlags);
         if(R_SUCCEEDED(res))
         {
-            HBLDR_3DSX_TID = titleId;
+            HBLDR_3DSX_TID = progInfo.programId;
             miscellaneousMenu.items[0].title = "Switch the hb. title to hblauncher_loader";
         }
         else
@@ -221,7 +222,6 @@ void MiscellaneousMenu_SaveSettings(void)
 
 void MiscellaneousMenu_InputRedirection(void)
 {
-    static MyThread *inputRedirectionThread = NULL;
     bool done = false;
 
     Result res;
@@ -231,11 +231,7 @@ void MiscellaneousMenu_InputRedirection(void)
 
     if(wasEnabled)
     {
-        res = InputRedirection_DoOrUndoPatches();
-        inputRedirectionEnabled = false;
-        res = MyThread_Join(inputRedirectionThread, 5 * 1000 * 1000 * 1000LL);
-        svcCloseHandle(inputRedirectionThreadStartedEvent);
-
+        res = InputRedirection_Disable(5 * 1000 * 1000 * 1000LL);
         if(res != 0)
             sprintf(buf, "Failed to stop InputRedirection (0x%08lx).", (u32)res);
         else
@@ -282,13 +278,18 @@ void MiscellaneousMenu_InputRedirection(void)
                     res = svcCreateEvent(&inputRedirectionThreadStartedEvent, RESET_STICKY);
                     if(R_SUCCEEDED(res))
                     {
-                        inputRedirectionThread = inputRedirectionCreateThread();
+                        inputRedirectionCreateThread();
                         res = svcWaitSynchronization(inputRedirectionThreadStartedEvent, 10 * 1000 * 1000 * 1000LL);
                         if(res == 0)
                             res = (Result)inputRedirectionStartResult;
 
                         if(res != 0)
+                        {
+                            svcCloseHandle(inputRedirectionThreadStartedEvent);
                             InputRedirection_DoOrUndoPatches();
+                            inputRedirectionEnabled = false;
+                        }
+                        inputRedirectionStartResult = 0;
                     }
                 }
 
@@ -336,6 +337,7 @@ void MiscellaneousMenu_SyncTimeDate(void)
     cantStart = R_FAILED(res) || !isSocURegistered;
 
     int utcOffset = 12;
+	int utcOffsetMinute = 0;
     int absOffset;
     do
     {
@@ -344,14 +346,15 @@ void MiscellaneousMenu_SyncTimeDate(void)
 
         absOffset = utcOffset - 12;
         absOffset = absOffset < 0 ? -absOffset : absOffset;
-        posY = Draw_DrawFormattedString(10, 30, COLOR_WHITE, "Current UTC offset:  %c%02d", utcOffset < 12 ? '-' : '+', absOffset);
-        posY = Draw_DrawFormattedString(10, posY + SPACING_Y, COLOR_WHITE, "Use DPAD Left/Right to change offset.\nPress A when done.") + SPACING_Y;
+        posY = Draw_DrawFormattedString(10, 30, COLOR_WHITE, "Current UTC offset:  %c%02d%02d", utcOffset < 12 ? '-' : '+', absOffset, utcOffsetMinute);
+        posY = Draw_DrawFormattedString(10, posY + SPACING_Y, COLOR_WHITE, "Use DPAD Left/Right to change hour offset.\nUse DPAD Up/Down to change minute offset.\nPress A when done.") + SPACING_Y;
 
         input = waitInput();
 
         if(input & BUTTON_LEFT) utcOffset = (24 + utcOffset - 1) % 24; // ensure utcOffset >= 0
         if(input & BUTTON_RIGHT) utcOffset = (utcOffset + 1) % 24;
-
+        if(input & BUTTON_UP) utcOffsetMinute = (utcOffsetMinute + 1) % 60;
+        if(input & BUTTON_DOWN) utcOffsetMinute = (60 + utcOffsetMinute - 1) % 60;
         Draw_FlushFramebuffer();
         Draw_Unlock();
     }
@@ -371,6 +374,7 @@ void MiscellaneousMenu_SyncTimeDate(void)
         if(R_SUCCEEDED(res))
         {
             t += 3600 * utcOffset;
+            t += 60 * utcOffsetMinute;
             gmtime_r(&t, &localt);
             res = ntpSetTimeDate(&localt);
         }

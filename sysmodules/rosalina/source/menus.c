@@ -1,6 +1,6 @@
 /*
 *   This file is part of Luma3DS
-*   Copyright (C) 2016-2019 Aurora Wright, TuxSH
+*   Copyright (C) 2016-2020 Aurora Wright, TuxSH
 *
 *   This program is free software: you can redistribute it and/or modify
 *   it under the terms of the GNU General Public License as published by
@@ -73,7 +73,7 @@ void RosalinaMenu_ShowCredits(void)
         Draw_Lock();
         Draw_DrawString(10, 10, COLOR_TITLE, "Rosalina -- Luma3DS credits");
 
-        u32 posY = Draw_DrawString(10, 30, COLOR_WHITE, "Luma3DS (c) 2016-2019 AuroraWright, TuxSH") + SPACING_Y;
+        u32 posY = Draw_DrawString(10, 30, COLOR_WHITE, "Luma3DS (c) 2016-2020 AuroraWright, TuxSH") + SPACING_Y;
 
         posY = Draw_DrawString(10, posY + SPACING_Y, COLOR_WHITE, "3DSX loading code by fincs");
         posY = Draw_DrawString(10, posY + SPACING_Y, COLOR_WHITE, "Networking code & basic GDB functionality by Stary");
@@ -114,8 +114,9 @@ void RosalinaMenu_Reboot(void)
 
         if(pressed & BUTTON_A)
         {
-            APT_HardwareResetAsync();
             menuLeave();
+            APT_HardwareResetAsync();
+            return;
         } else if(pressed & BUTTON_B)
             return;
     }
@@ -143,6 +144,7 @@ void RosalinaMenu_PowerOff(void) // Soft shutdown.
         {
             menuLeave();
             srvPublishToSubscriber(0x203, 0);
+            return;
         }
         else if(pressed & BUTTON_B)
             return;
@@ -150,14 +152,52 @@ void RosalinaMenu_PowerOff(void) // Soft shutdown.
     while(!terminationRequest);
 }
 
-extern u8 framebufferCache[FB_BOTTOM_SIZE];
-void RosalinaMenu_TakeScreenshot(void)
-{
+
 #define TRY(expr) if(R_FAILED(res = (expr))) goto end;
 
+static s64 timeSpentConvertingScreenshot = 0;
+static s64 timeSpentWritingScreenshot = 0;
+
+static Result RosalinaMenu_WriteScreenshot(IFile *file, bool top, bool left)
+{
     u64 total;
+    Result res = 0;
+    u32 dimX = top ? 400 : 320;
+    u32 lineSize = 3 * dimX;
+    u32 remaining = lineSize * 240;
+    u8 *framebufferCache = (u8 *)Draw_GetFramebufferCache();
+    u8 *framebufferCacheEnd = framebufferCache + Draw_GetFramebufferCacheSize();
+
+    u8 *buf = framebufferCache;
+    Draw_CreateBitmapHeader(framebufferCache, dimX, 240);
+    buf += 54;
+
+    u32 y = 0;
+    // Our buffer might be smaller than the size of the screenshot...
+    while (remaining != 0)
+    {
+        s64 t0 = svcGetSystemTick();
+        u32 available = (u32)(framebufferCacheEnd - buf);
+        u32 size = available < remaining ? available : remaining;
+        u32 nlines = size / lineSize;
+        Draw_ConvertFrameBufferLines(buf, y, nlines, top, left);
+
+        s64 t1 = svcGetSystemTick();
+        timeSpentConvertingScreenshot += t1 - t0;
+        TRY(IFile_Write(file, &total, framebufferCache, (y == 0 ? 54 : 0) + lineSize * nlines, 0)); // don't forget to write the header
+        timeSpentWritingScreenshot += svcGetSystemTick() - t1;
+
+        y += nlines;
+        remaining -= lineSize * nlines;
+        buf = framebufferCache;
+    }
+    end: return res;
+}
+
+void RosalinaMenu_TakeScreenshot(void)
+{
     IFile file;
-    Result res;
+    Result res = 0;
 
     char filename[64];
 
@@ -165,6 +205,9 @@ void RosalinaMenu_TakeScreenshot(void)
     FS_ArchiveID archiveId;
     s64 out;
     bool isSdMode;
+
+    timeSpentConvertingScreenshot = 0;
+    timeSpentWritingScreenshot = 0;
 
     if(R_FAILED(svcGetSystemInfo(&out, 0x10000, 0x203))) svcBreak(USERBREAK_ASSERT);
     isSdMode = (bool)out;
@@ -229,49 +272,19 @@ void RosalinaMenu_TakeScreenshot(void)
 
     sprintf(filename, "/luma/screenshots/%04lu-%02lu-%02lu_%02lu-%02lu-%02lu.%03llu_top.bmp", year, month, days, hours, minutes, seconds, milliseconds);
     TRY(IFile_Open(&file, archiveId, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, filename), FS_OPEN_CREATE | FS_OPEN_WRITE));
-    Draw_CreateBitmapHeader(framebufferCache, 400, 240);
-
-    for(u32 y = 0; y < 120; y++)
-        Draw_ConvertFrameBufferLine(framebufferCache + 54 + 3 * 400 * y, true, true, y);
-
-    TRY(IFile_Write(&file, &total, framebufferCache, 54 + 3 * 400 * 120, 0));
-
-    for(u32 y = 120; y < 240; y++)
-        Draw_ConvertFrameBufferLine(framebufferCache + 3 * 400 * (y - 120), true, true, y);
-
-    TRY(IFile_Write(&file, &total, framebufferCache, 3 * 400 * 120, 0));
+    TRY(RosalinaMenu_WriteScreenshot(&file, true, true));
     TRY(IFile_Close(&file));
 
     sprintf(filename, "/luma/screenshots/%04lu-%02lu-%02lu_%02lu-%02lu-%02lu.%03llu_bot.bmp", year, month, days, hours, minutes, seconds, milliseconds);
     TRY(IFile_Open(&file, archiveId, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, filename), FS_OPEN_CREATE | FS_OPEN_WRITE));
-    Draw_CreateBitmapHeader(framebufferCache, 320, 240);
-
-    for(u32 y = 0; y < 120; y++)
-        Draw_ConvertFrameBufferLine(framebufferCache + 54 + 3 * 320 * y, false, true, y);
-
-    TRY(IFile_Write(&file, &total, framebufferCache, 54 + 3 * 320 * 120, 0));
-
-    for(u32 y = 120; y < 240; y++)
-        Draw_ConvertFrameBufferLine(framebufferCache + 3 * 320 * (y - 120), false, true, y);
-
-    TRY(IFile_Write(&file, &total, framebufferCache, 3 * 320 * 120, 0));
+    TRY(RosalinaMenu_WriteScreenshot(&file, false, true));
     TRY(IFile_Close(&file));
 
     if((GPU_FB_TOP_FMT & 0x20) && (Draw_GetCurrentFramebufferAddress(true, true) != Draw_GetCurrentFramebufferAddress(true, false)))
     {
         sprintf(filename, "/luma/screenshots/%04lu-%02lu-%02lu_%02lu-%02lu-%02lu.%03llu_top_right.bmp", year, month, days, hours, minutes, seconds, milliseconds);
         TRY(IFile_Open(&file, archiveId, fsMakePath(PATH_EMPTY, ""), fsMakePath(PATH_ASCII, filename), FS_OPEN_CREATE | FS_OPEN_WRITE));
-        Draw_CreateBitmapHeader(framebufferCache, 400, 240);
-
-        for(u32 y = 0; y < 120; y++)
-            Draw_ConvertFrameBufferLine(framebufferCache + 54 + 3 * 400 * y, true, false, y);
-
-        TRY(IFile_Write(&file, &total, framebufferCache, 54 + 3 * 400 * 120, 0));
-
-        for(u32 y = 120; y < 240; y++)
-            Draw_ConvertFrameBufferLine(framebufferCache + 3 * 400 * (y - 120), true, false, y);
-
-        TRY(IFile_Write(&file, &total, framebufferCache, 3 * 400 * 120, 0));
+        TRY(RosalinaMenu_WriteScreenshot(&file, true, false));
         TRY(IFile_Close(&file));
     }
 
@@ -279,8 +292,6 @@ end:
     IFile_Close(&file);
     svcFlushEntireDataCache();
     Draw_SetupFramebuffer();
-    Draw_ClearFramebuffer();
-    Draw_FlushFramebuffer();
     Draw_Unlock();
 
     do
@@ -290,7 +301,14 @@ end:
         if(R_FAILED(res))
             Draw_DrawFormattedString(10, 30, COLOR_WHITE, "Operation failed (0x%08lx).", (u32)res);
         else
-            Draw_DrawString(10, 30, COLOR_WHITE, "Operation succeeded.");
+        {
+            u32 t1 = (u32)(1000 * timeSpentConvertingScreenshot / SYSCLOCK_ARM11);
+            u32 t2 = (u32)(1000 * timeSpentWritingScreenshot / SYSCLOCK_ARM11);
+            u32 posY = 30;
+            posY = Draw_DrawString(10, posY, COLOR_WHITE, "Operation succeeded.\n\n");
+            posY = Draw_DrawFormattedString(10, posY, COLOR_WHITE, "Time spent converting:    %5lums\n", t1);
+            posY = Draw_DrawFormattedString(10, posY, COLOR_WHITE, "Time spent writing files: %5lums\n", t2);
+        }
 
         Draw_FlushFramebuffer();
         Draw_Unlock();
