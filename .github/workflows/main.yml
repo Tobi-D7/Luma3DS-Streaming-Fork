@@ -40,7 +40,7 @@ jobs:
           sudo chmod +x makerom
           mv makerom /usr/local/bin
           rm makerom-v0.17-ubuntu_x86_64.zip
-          pip install -U git+https://github.com/TuxSH/firmtool.git
+          pip3 install -U git+https://github.com/TuxSH/firmtool.git
       - name: Build
         id: build
         run: |
